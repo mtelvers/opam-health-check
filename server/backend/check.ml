@@ -32,6 +32,81 @@ let network = ["host"]
 let obuilder_to_string spec =
   Sexplib0.Sexp.to_string_mach (Obuilder_spec.sexp_of_t spec)
 
+(* Submit Day10 custom job - handles all sub-commands: list, health-check, revdeps *)
+let ocluster_day10_build ~cap ~conf ~switch ~debug ~stdout ~stderr ~sub_command ~commit_sha ~package_name =
+  let ocaml_version = Intf.Compiler.to_string (Intf.Switch.compiler switch) in
+  let with_test = Server_configfile.with_test conf in
+  let* () = match debug with
+    | true -> Lwt_io.fprintf stderr "Day10 custom job: %s %s (OCaml %s, with-test: %b)\n" sub_command package_name ocaml_version with_test
+    | false -> Lwt.return ()
+  in
+  let* service = Capnp_rpc_lwt.Sturdy_ref.connect_exn cap in
+  Capnp_rpc_lwt.Capability.with_ref service @@ fun submission_service ->
+  (* Build Day10 payload *)
+  let payload builder =
+    let open Cluster_api.Raw.Builder in
+    let day10 = Day10.init_pointer builder in
+    Day10.sub_command_set day10 sub_command;
+    Day10.commit_sha_set day10 commit_sha;
+    Day10.package_name_set day10 package_name;
+    Day10.ocaml_version_set day10 ocaml_version;
+    Day10.with_test_set day10 with_test
+  in
+  let action = Cluster_api.Submission.custom_build @@
+    Cluster_api.Custom.v ~kind:"day10" payload
+  in
+  let cache_hint = "opam-health-check-day10-"^sub_command^"-"^package_name in
+  let pool = Server_configfile.platform_pool conf in
+  Capnp_rpc_lwt.Capability.with_ref (Cluster_api.Submission.submit submission_service ~urgent:false ~pool ~action ~cache_hint ~secrets:[] ?src:None) @@ fun ticket ->
+  Capnp_rpc_lwt.Capability.with_ref (Cluster_api.Ticket.job ticket) @@ fun job ->
+  let* v = Capnp_rpc_lwt.Capability.await_settled job in
+  match v with
+  | Ok () ->
+      let proc =
+        let rec tail job start =
+          let* v = Cluster_api.Job.log job start in
+          match v with
+          | Error (`Capnp e) -> Lwt_io.write stderr (Fmt.str "Error tailing logs: %a" Capnp_rpc.Error.pp e)
+          | Ok ("", _) -> Lwt.return_unit
+          | Ok (data, next) ->
+              let* () = Lwt_io.write stdout data in
+              tail job next
+        in
+        let* () = tail job 0L in
+        let* v = Cluster_api.Job.result job in
+        match v with
+        | Ok _ ->
+            Lwt.return (Ok ())
+        | Error (`Capnp e) ->
+            let+ () = Lwt_io.write stdout (Fmt.str "%a" Capnp_rpc.Error.pp e) in
+            Error ()
+      in
+      let timeout =
+        let hours = Server_configfile.job_timeout conf in
+        let* () = Lwt_unix.sleep (hours *. 60.0 *. 60.0) in
+        let cancel =
+          let* cancel_result = Cluster_api.Job.cancel job in
+          let* () = Lwt_io.write_line stdout ("+++ Timeout!! ("^string_of_float hours^" hours) +++") in
+          match cancel_result with
+          | Ok () ->
+              Lwt_io.write_line stdout "+++ Job cancelled +++"
+          | Error (`Capnp err) ->
+              Lwt_io.write_line stdout (Fmt.str "+++ Could not cancel job: %a +++" Capnp_rpc.Error.pp err)
+        in
+        let timeout =
+          let minute = 1 in
+          let* () = Lwt_unix.sleep (float_of_int (minute * 60)) in
+          Lwt_io.write_line stdout "+++ Cancellation failed +++"
+        in
+        let* () = Lwt.pick [cancel; timeout] in
+        let+ () = Lwt_io.fprintf stderr "Day10 job %s %s timed out (%f hours)" sub_command package_name hours in
+        Error ()
+      in
+      Lwt.pick [timeout; proc]
+  | Error {Capnp_rpc.Exception.reason; _} ->
+      let+ () = Lwt_io.write_line stderr ("capnp-rpc failed to settle: "^reason) in
+      Error ()
+
 let ocluster_build ~cap ~conf ~with_dune ~base_obuilder ~debug ~stdout ~stderr commands =
   let* cache = cache ~stderr ~conf ~with_dune in
   let scripts = ListLabels.map commands ~f:(fun command ->
@@ -113,6 +188,36 @@ let exec_out ~fexec ~fout =
   let+ r = proc in
   r, res
 
+(* Helper to check if a line looks like a valid package name.version *)
+let is_valid_package_line line =
+  try
+    let _ = OpamPackage.of_string line in
+    true
+  with _ -> false
+
+(* Generic helper to parse day10 output - reads lines and filters valid package names *)
+let ocluster_day10_str ~debug ~cap ~conf ~stderr ~commit_sha ~sub_command ~package_name switch =
+  let rec read_lines ~stdin acc =
+    let* line = Lwt_io.read_line_opt stdin in
+    match line with
+    | Some line ->
+        let* () = (if debug then Lwt_io.write_line stderr line else Lwt.return_unit) in
+        (* Only keep lines that are valid package names *)
+        let acc' = if is_valid_package_line line then line :: acc else acc in
+        read_lines ~stdin acc'
+    | None -> Lwt.return (List.rev acc)
+  in
+  let* v = exec_out
+    ~fout:(fun ~stdin -> read_lines ~stdin [])
+    ~fexec:(fun ~stdout ->
+      ocluster_day10_build ~cap ~conf ~switch ~debug ~stdout ~stderr
+        ~sub_command ~commit_sha ~package_name)
+  in
+  match v, sub_command with
+  | (Ok (), results), _ -> Lwt.return results
+  | (Error (), _), "list" -> Lwt.fail (Failure "Failure in ocluster day10 list")
+  | (Error (), _), _ -> Lwt.return [] (* Return empty list on error for revdeps *)
+
 let ocluster_build_str ~important ~debug ~cap ~conf ~with_dune ~base_obuilder ~stderr ~default c =
   let rec aux ~stdin =
     let* line = Lwt_io.read_line_opt stdin in
@@ -180,12 +285,28 @@ let failure_kind_dune logfile =
     in
     lookup `Other
 
+let failure_kind_day10 logfile =
+  Lwt_io.with_file ~mode:Lwt_io.Input (Fpath.to_string logfile) @@ fun ic ->
+    let rec lookup res =
+      let* line = Lwt_io.read_line_opt ic in
+      match line with
+      | Some "[WARNING] no_solution" -> Lwt.return `NotAvailable
+      | Some "[WARNING] dependency_failed" -> Lwt.return `Partial
+      | Some "[ERROR] failure" -> Lwt.return `Failure
+      | Some _ -> lookup res
+      | None -> Lwt.return res
+    in
+    lookup `Other
+
 let failure_kind conf ~switch ~pkg logfile =
   match Intf.Switch.build_with switch with
+  | Intf.Build_with.Day10 ->
+      failure_kind_day10 logfile
   | Intf.Build_with.Opam ->
       let timeout = Server_configfile.job_timeout conf in
       failure_kind_opam ~timeout ~pkg logfile
-  | Intf.Build_with.Dune -> failure_kind_dune logfile
+  | Intf.Build_with.Dune ->
+      failure_kind_dune logfile
 
 let with_test pkg = {|
 if [ $res = 0 ]; then
@@ -285,6 +406,9 @@ let remove_packages =
 
 let run_script ~conf ~switch ~extra_repos pkg =
   match Intf.Switch.build_with switch with
+  | Intf.Build_with.Day10 ->
+      (* Day10 jobs don't use run_script - they go through ocluster_day10_build *)
+      failwith "run_script should not be called for Day10 builds"
   | Intf.Build_with.Opam ->
       let build = Printf.sprintf {|opam remove -y %s
 opam install -vy %s
@@ -364,15 +488,22 @@ fi |} pkg pkg pkg (Server_configfile.platform_distribution conf)
         Printf.sprintf {|%s dune build --release --only-packages $(cat /tmp/packages-for-dune) || (echo "opam-health-check: Build failed" && exit 1)|} dune_path
       ]])
 
-let run_job ~cap ~conf ~pool ~debug ~stderr ~base_obuilder ~extra_repos ~switch ~num logdir pkg =
+let run_job ~cap ~conf ~pool ~debug ~stderr ~commit_sha ~base_obuilder ~extra_repos ~switch ~num logdir pkg =
   Lwt_pool.use pool begin fun () ->
     let name = Intf.Switch.name switch in
     let* () = Lwt_io.write_line stderr ("["^num^"] Checking "^pkg^" on "^name^"…") in
     let logfile = Server_workdirs.tmplogfile ~pkg ~name logdir in
     let* v =
       Lwt_io.with_file ~flags:Unix.[O_WRONLY; O_CREAT; O_TRUNC] ~perm:0o640 ~mode:Lwt_io.Output (Fpath.to_string logfile) (fun stdout ->
-        let with_dune = Intf.Switch.with_dune switch in
-        ocluster_build ~cap ~conf ~with_dune ~debug ~base_obuilder ~stdout ~stderr (run_script ~conf ~switch ~extra_repos pkg))
+        match Intf.Switch.build_with switch with
+        | Intf.Build_with.Day10 ->
+            (* Use Day10 health-check *)
+            ocluster_day10_build ~cap ~conf ~switch ~debug ~stdout ~stderr
+              ~sub_command:"health-check" ~commit_sha ~package_name:pkg
+        | Intf.Build_with.Opam | Intf.Build_with.Dune ->
+            (* Use OBuilder with run_script *)
+            let with_dune = Intf.Switch.with_dune switch in
+            ocluster_build ~cap ~conf ~with_dune ~debug ~base_obuilder ~stdout ~stderr (run_script ~conf ~switch ~extra_repos pkg))
     in
     match v with
     | Ok () ->
@@ -489,12 +620,20 @@ let get_obuilder ~conf ~cache ~opam_repo ~opam_repo_commit ~extra_repos switch =
     )
   end
 
-let get_pkgs ~debug ~cap ~conf ~stderr (switch, base_obuilder) =
+let get_pkgs ~debug ~cap ~conf ~stderr ~commit_sha (switch, base_obuilder) =
   let with_dune = Intf.Switch.with_dune switch in
   let compiler = Intf.Switch.compiler switch in
   let line = Format.asprintf "Getting packages list for %a… (this may take an hour or two)" Intf.Compiler.pp compiler in
   let* () = Lwt_io.write_line stderr line in
-  let* pkgs = ocluster_build_str ~important:true ~debug ~cap ~conf ~with_dune ~base_obuilder ~stderr ~default:None (Server_configfile.list_command conf) in
+  let* pkgs =
+    match Intf.Switch.build_with switch with
+    | Intf.Build_with.Day10 ->
+        (* Use Day10 list command *)
+        ocluster_day10_str ~debug ~cap ~conf ~stderr ~commit_sha ~sub_command:"list" ~package_name:"" switch
+    | Intf.Build_with.Opam | Intf.Build_with.Dune ->
+        (* Use OBuilder with list command *)
+        ocluster_build_str ~important:true ~debug ~cap ~conf ~with_dune ~base_obuilder ~stderr ~default:None (Server_configfile.list_command conf)
+  in
   let pkgs = List.filter begin fun pkg ->
     Oca_lib.is_valid_filename pkg &&
     match Intf.Pkg.name (Intf.Pkg.create ~full_name:pkg ~instances:[] ~opam:OpamFile.OPAM.empty ~revdeps:0) with (* TODO: Remove this horror *)
@@ -540,9 +679,17 @@ let revdeps_script pkg =
   {|opam list --color=never -s --recursive --depopts --depends-on |}^pkg^{| && \
     opam list --color=never -s --with-test --with-doc --depopts --depends-on |}^pkg
 
-let get_metadata ~debug ~jobs ~cap ~conf ~with_dune ~pool ~stderr logdir (_, base_obuilder) pkgs =
-  let get_revdeps ~base_obuilder ~pkgname ~pkg ~logdir =
-    let* revdeps = ocluster_build_str ~important:false ~debug ~cap ~conf ~with_dune ~base_obuilder ~stderr ~default:(Some []) (revdeps_script pkg) in
+let get_metadata ~debug ~jobs ~cap ~conf ~with_dune ~pool ~stderr ~commit_sha logdir (switch, base_obuilder) pkgs =
+  let get_revdeps ~switch ~base_obuilder ~pkgname ~pkg ~logdir =
+    let* revdeps =
+      match Intf.Switch.build_with switch with
+      | Intf.Build_with.Day10 ->
+          (* Use Day10 revdeps command *)
+          ocluster_day10_str ~debug ~cap ~conf ~stderr ~commit_sha ~sub_command:"revdeps" ~package_name:pkg switch
+      | Intf.Build_with.Opam | Intf.Build_with.Dune ->
+          (* Use OBuilder with revdeps_script *)
+          ocluster_build_str ~important:false ~debug ~cap ~conf ~with_dune ~base_obuilder ~stderr ~default:(Some []) (revdeps_script pkg)
+    in
     let module Set = Set.Make(String) in
     let revdeps = Set.of_list revdeps in
     let revdeps = Set.remove pkgname revdeps in (* https://github.com/ocaml/opam/issues/4446 *)
@@ -564,7 +711,7 @@ let get_metadata ~debug ~jobs ~cap ~conf ~with_dune ~pool ~stderr logdir (_, bas
     let job =
       Lwt_pool.use pool begin fun () ->
         let* () = Lwt_io.write_line stderr ("Getting metadata for "^full_name) in
-        let* () = get_revdeps ~base_obuilder ~pkgname ~pkg:full_name ~logdir in
+        let* () = get_revdeps ~switch ~base_obuilder ~pkgname ~pkg:full_name ~logdir in
         if Pkg_set.mem pkgname pkgs_set then Lwt.return_unit else get_latest_metadata ~base_obuilder ~pkgname ~logdir
       end
     in
@@ -612,7 +759,7 @@ let move_tmpdirs_to_final ~switches logdir workdir =
   let* () = Lwt_unix.rename (Fpath.to_string tmpmetadatadir) (Fpath.to_string metadatadir) in
   Oca_lib.rm_rf tmpdir
 
-let run_jobs ~cap ~conf ~debug ~pool ~extra_repos ~stderr logdir switches pkgs =
+let run_jobs ~cap ~conf ~debug ~pool ~extra_repos ~stderr ~commit_sha logdir switches pkgs =
   let len = Pkg_set.cardinal pkgs * List.length switches in
   Prometheus.Gauge.set Metrics.jobs_total (float_of_int len);
   let len_suffix = "/"^string_of_int len in
@@ -620,7 +767,7 @@ let run_jobs ~cap ~conf ~debug ~pool ~extra_repos ~stderr logdir switches pkgs =
     List.fold_left begin fun (i, jobs) (switch, base_obuilder) ->
       let i = succ i in
       let num = string_of_int i^len_suffix in
-      let job = run_job ~cap ~conf ~debug ~pool ~stderr ~extra_repos ~base_obuilder ~switch ~num logdir full_name in
+      let job = run_job ~cap ~conf ~debug ~pool ~stderr ~commit_sha ~extra_repos ~base_obuilder ~switch ~num logdir full_name in
       (i, job :: jobs)
     end (i, jobs) switches
   end pkgs (0, [])
@@ -762,12 +909,12 @@ let run ~debug ~cap_file ~on_finished ~conf oca_cache workdir =
             let new_logdir = Server_workdirs.new_logdir ~compressed ~hash:opam_repo_commit ~start_time workdir in
             let* () = Server_workdirs.init_base_jobs ~switches:switches' new_logdir in
             let pool = Lwt_pool.create (Server_configfile.processes conf) (fun () -> Lwt.return_unit) in
-            let* pkgs = Lwt_list.map_p (get_pkgs ~debug ~cap ~stderr ~conf) switches in
+            let* pkgs = Lwt_list.map_p (get_pkgs ~debug ~cap ~stderr ~conf ~commit_sha:opam_repo_commit) switches in
             let pkgs = Pkg_set.of_list (List.concat pkgs) in
             Prometheus.Gauge.set Metrics.number_of_packages (float_of_int (Pkg_set.cardinal pkgs));
             let* () = Oca_lib.timer_log timer stderr "Initialization" in
-            let (_, jobs) = run_jobs ~cap ~conf ~debug ~pool ~stderr ~extra_repos new_logdir switches pkgs in
-            let (_, jobs) = get_metadata ~debug ~jobs ~cap ~conf ~with_dune ~pool ~stderr new_logdir switch pkgs in
+            let (_, jobs) = run_jobs ~cap ~conf ~debug ~pool ~stderr ~extra_repos ~commit_sha:opam_repo_commit new_logdir switches pkgs in
+            let (_, jobs) = get_metadata ~debug ~jobs ~cap ~conf ~with_dune ~pool ~stderr ~commit_sha:opam_repo_commit new_logdir switch pkgs in
             let* () = Lwt.join jobs in
             let* () = Oca_lib.timer_log timer stderr "Operation" in
             let* () = Lwt_io.write_line stderr "Finishing up…" in

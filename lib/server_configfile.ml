@@ -3,6 +3,7 @@ open Lwt.Syntax
 let yaml_of_build_with = function
   | Intf.Build_with.Opam -> `String "opam"
   | Intf.Build_with.Dune -> `String "dune"
+  | Intf.Build_with.Day10 -> `String "day10"
 
 let config_parser_fail value =
   failwith @@ Printf.sprintf "Config parser: value %S is invalid" value
@@ -10,6 +11,7 @@ let config_parser_fail value =
 let build_with_of_yaml_exn = function
   | `String "opam" -> Intf.Build_with.Opam
   | `String "dune" -> Intf.Build_with.Dune
+  | `String "day10" -> Intf.Build_with.Day10
   | otherwise -> config_parser_fail @@ Yaml.to_string_exn otherwise
 
 type t = {

@@ -15,6 +15,7 @@ module Build_with : sig
   type t =
     | Opam
     | Dune
+    | Day10
 end
 
 module Compiler : sig

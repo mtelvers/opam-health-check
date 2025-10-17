@@ -49,13 +49,17 @@ module Build_with = struct
   type t =
     | Opam
     | Dune
+    | Day10
 
   let compare a b =
     match a, b with
-    | Opam, Dune -> -1
-    | Dune, Dune
     | Opam, Opam -> 0
+    | Opam, _ -> -1
     | Dune, Opam -> 1
+    | Dune, Dune -> 0
+    | Dune, Day10 -> -1
+    | Day10, Day10 -> 0
+    | Day10, _ -> 1
 end
 
 module Switch = struct
@@ -76,7 +80,7 @@ module Switch = struct
   let with_dune {build_with; _} =
     match build_with with
     | Build_with.Dune -> true
-    | Build_with.Opam -> false
+    | Build_with.Opam | Build_with.Day10 -> false
 
   let compare {compiler; build_with; name} x =
     match Compiler.compare compiler x.compiler with
