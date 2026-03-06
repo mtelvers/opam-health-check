@@ -8,7 +8,7 @@ let cache ~stderr ~conf ~with_dune =
     | "freebsd"
     | "linux" -> Some (Obuilder_spec.Cache.v "opam-archives" ~target:"/home/opam/.opam/download-cache")
     | "macos" -> Some (Obuilder_spec.Cache.v "opam-archives" ~target:"/Users/mac1000/.opam/download-cache")
-    | "windows" -> Some (Obuilder_spec.Cache.v "opam-archives" ~target:"c:\\Users\\opam\\AppData\\Local\\opam\\download-cache")
+    | "windows" -> Some (Obuilder_spec.Cache.v "opam-archives" ~target:"c:\\opam\\.opam\\download-cache")
     | os -> failwith ("Opam cache not supported on '" ^ os) (* TODO: Should other platforms simply take the same ocurrent/opam: prefix? *)
   in
   let brew_cache = match os with
@@ -428,7 +428,7 @@ let get_obuilder ~conf ~cache ~opam_repo ~opam_repo_commit ~extra_repos switch =
     | "linux" -> "sudo ln -f /usr/bin/opam-dev /usr/bin/opam"
     | "freebsd" -> "sudo ln -f /usr/local/bin/opam-dev /usr/local/bin/opam"
     | "macos" -> "ln -f ~/local/bin/opam-dev ~/local/bin/opam"
-    | "windows" -> "ln -f /usr/bin/opam-dev.exe /usr/bin/opam.exe"
+    | "windows" -> "ln -f /usr/local/bin/opam-dev.exe /usr/local/bin/opam.exe"
     | os -> failwith ("OS '"^os^"' not supported")
   in
   let opam_init_options = match os with
