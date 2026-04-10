@@ -166,9 +166,15 @@ module Make (Backend : Backend_intf.S) = struct
                 let* html = Cache.get_html_diff ~conf ~old_logdir ~new_logdir Backend.cache in
                 serv_text ~content_type:"text/html" html))
     | ["log"; logdir; comp; state; pkg] ->
+        (* NOTE: sync up with server/lib/json.ml *)
         get_log ~logdir ~comp ~state ~pkg
-    | ["api"; "v1"; "latest"; "packages"] ->
-        let* json = Cache.get_json_latest_packages Backend.cache in
+    | ["api"; ("v1" | "v2") as api_version; "latest"; "packages"] ->
+        let api_version = match api_version with
+          | "v1" -> `V1
+          | "v2" -> `V2
+          | _ -> assert false
+        in
+        let* json = Cache.get_json_latest_packages api_version Backend.cache in
         serv_text ~content_type:"application/json" json
     | ["metrics"] ->
         let* data = Prometheus.CollectorRegistry.(collect default) in
