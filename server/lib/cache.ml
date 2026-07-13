@@ -164,6 +164,13 @@ let must_show_package ~logsearch query ~is_latest pkg =
       true
   end >>&& begin fun () ->
     Lwt.return @@
+    match snd query.Html.packages with
+    | Some re ->
+        Re.execp re (Pkg.name pkg) ||
+        Re.execp re (Pkg.full_name pkg)
+    | None -> true
+  end >>&& begin fun () ->
+    Lwt.return @@
     match snd query.Html.maintainers with
     | Some re -> List.exists (Re.execp re) opam.OpamFile.OPAM.maintainer
     | None -> true
@@ -269,14 +276,18 @@ let get_html_run_list self =
   let+ pkgs = self.pkgs in
   Html.get_run_list (List.map fst pkgs)
 
-let get_json_latest_packages self =
+let get_json_latest_packages api_version self =
   let* self = !self in
   let* v = self.logdirs in
-  let+ pkgs = match v with
-    | [] -> Lwt.return []
+  let+ pkgs, logdir =
+    match v with
+    | [] -> Lwt.return ([], None)
     | logdir::_ ->
         let* pkgs = self.pkgs in
-        get_or_recompute (List.assoc ~eq:Server_workdirs.logdir_equal logdir pkgs)
+        let* pkgs = get_or_recompute (List.assoc ~eq:Server_workdirs.logdir_equal logdir pkgs) in
+        match api_version with
+        | `V1 -> Lwt.return (pkgs, None)
+        | `V2 -> Lwt.return (pkgs, Some logdir)
   in
-  let json = Json.pkgs_to_json pkgs in
+  let json = Json.pkgs_to_json ~logdir pkgs in
   Yojson.Safe.to_string json
