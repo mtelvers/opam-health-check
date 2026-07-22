@@ -36,6 +36,16 @@ let obuilder_to_string spec =
 let ocluster_day10_build ~cap ~conf ~switch ~debug ~stdout ~stderr ~sub_command ~commit_sha ~package_name =
   let ocaml_version = Intf.Compiler.to_string (Intf.Switch.compiler switch) in
   let with_test = Server_configfile.with_test conf in
+  let os = Server_configfile.platform_os conf in
+  let arch = Server_configfile.platform_arch conf in
+  (* platform_distribution is the ocaml-ci-style distro string, e.g. "debian-13";
+     split it into day10's --os-distribution and --os-version. *)
+  let os_distribution, os_version =
+    let d = Server_configfile.platform_distribution conf in
+    match String.rindex_opt d '-' with
+    | Some i -> (String.sub d 0 i, String.sub d (i + 1) (String.length d - i - 1))
+    | None -> (d, "")
+  in
   let* () = match debug with
     | true -> Lwt_io.fprintf stderr "Day10 custom job: %s %s (OCaml %s, with-test: %b)\n" sub_command package_name ocaml_version with_test
     | false -> Lwt.return ()
@@ -46,11 +56,15 @@ let ocluster_day10_build ~cap ~conf ~switch ~debug ~stdout ~stderr ~sub_command 
   let payload builder =
     let open Cluster_api.Raw.Builder in
     let day10 = Day10.init_pointer builder in
-    Day10.sub_command_set day10 sub_command;
-    Day10.commit_sha_set day10 commit_sha;
-    Day10.package_name_set day10 package_name;
+    Day10.verb_set day10 sub_command;
+    Day10.opam_repository_commit_set day10 commit_sha;
+    Day10.package_set day10 package_name;
     Day10.ocaml_version_set day10 ocaml_version;
-    Day10.with_test_set day10 with_test
+    Day10.with_test_set day10 with_test;
+    Day10.os_set day10 os;
+    Day10.arch_set day10 arch;
+    Day10.os_distribution_set day10 os_distribution;
+    Day10.os_version_set day10 os_version
   in
   let action = Cluster_api.Submission.custom_build @@
     Cluster_api.Custom.v ~kind:"day10" payload
