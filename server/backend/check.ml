@@ -713,16 +713,13 @@ let revdeps_script pkg =
   {|opam list --color=never -s --recursive --depopts --depends-on |}^pkg^{| && \
     opam list --color=never -s --with-test --with-doc --depopts --depends-on |}^pkg
 
-let get_metadata ~debug ~jobs ~cap ~conf ~with_dune ~pool ~stderr ~commit_sha logdir (switch, base_obuilder) pkgs =
-  let get_revdeps ~switch ~base_obuilder ~pkgname ~pkg ~logdir =
+let get_metadata ~debug ~jobs ~cap ~conf ~with_dune ~pool ~stderr ~commit_sha:_ logdir (switch, base_obuilder) pkgs =
+  let get_revdeps ~switch:_ ~base_obuilder ~pkgname ~pkg ~logdir =
     let* revdeps =
-      match Intf.Switch.build_with switch with
-      | Intf.Build_with.Day10 ->
-          (* Use Day10 revdeps command *)
-          ocluster_day10_str ~debug ~cap ~conf ~stderr ~commit_sha ~sub_command:"revdeps" ~package_name:pkg switch
-      | Intf.Build_with.Opam | Intf.Build_with.Dune ->
-          (* Use OBuilder with revdeps_script *)
-          ocluster_build_str ~important:false ~debug ~cap ~conf ~with_dune ~base_obuilder ~stderr ~default:(Some []) (revdeps_script pkg)
+      (* revdeps is a cheap `opam list` query, not a build, so day10's layer
+         caching gives no benefit. Run it as an OBuilder job on all switches
+         (base_obuilder is built for every switch, including day10). *)
+      ocluster_build_str ~important:false ~debug ~cap ~conf ~with_dune ~base_obuilder ~stderr ~default:(Some []) (revdeps_script pkg)
     in
     let module Set = Set.Make(String) in
     let revdeps = Set.of_list revdeps in
