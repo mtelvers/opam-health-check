@@ -304,6 +304,7 @@ let failure_kind_day10 logfile =
     let rec lookup res =
       let* line = Lwt_io.read_line_opt ic in
       match line with
+      | Some "[NOTE] success" -> Lwt.return `Success
       | Some "[WARNING] no_solution" -> Lwt.return `NotAvailable
       | Some "[WARNING] dependency_failed" -> Lwt.return `Partial
       | Some "[ERROR] failure" -> Lwt.return `Failure
@@ -315,7 +316,10 @@ let failure_kind_day10 logfile =
 let failure_kind conf ~switch ~pkg logfile =
   match Intf.Switch.build_with switch with
   | Intf.Build_with.Day10 ->
-      failure_kind_day10 logfile
+      (* day10 results are classified directly in run_job via failure_kind_day10:
+         day10 health-check exits 0 regardless of outcome, so the result must be
+         read from the log marker rather than the job's exit status. *)
+      assert false
   | Intf.Build_with.Opam ->
       let timeout = Server_configfile.job_timeout conf in
       failure_kind_opam ~timeout ~pkg logfile
@@ -519,28 +523,44 @@ let run_job ~cap ~conf ~pool ~debug ~stderr ~commit_sha ~base_obuilder ~extra_re
             let with_dune = Intf.Switch.with_dune switch in
             ocluster_build ~cap ~conf ~with_dune ~debug ~base_obuilder ~stdout ~stderr (run_script ~conf ~switch ~extra_repos pkg))
     in
-    match v with
-    | Ok () ->
-        Prometheus.Counter.inc_one Metrics.jobs_ok;
-        let* () = Lwt_io.write_line stderr ("["^num^"] succeeded.") in
-        Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpgoodlog ~pkg ~name logdir))
-    | Error () ->
-        Prometheus.Counter.inc_one Metrics.jobs_error;
-        let* v = failure_kind conf ~switch ~pkg logfile in
-        begin match v with
-        | `Partial ->
-            let* () = Lwt_io.write_line stderr ("["^num^"] finished with a partial failure.") in
-            Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmppartiallog ~pkg ~name logdir))
-        | `Failure ->
-            let* () = Lwt_io.write_line stderr ("["^num^"] failed.") in
-            Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpbadlog ~pkg ~name logdir))
-        | `NotAvailable ->
-            let* () = Lwt_io.write_line stderr ("["^num^"] finished with not available.") in
-            Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpnotavailablelog ~pkg ~name logdir))
-        | `Other | `AcceptFailures | `Timeout ->
-            let* () = Lwt_io.write_line stderr ("["^num^"] finished with an internal failure.") in
-            Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpinternalfailurelog ~pkg ~name logdir))
+    let mark_good () =
+      Prometheus.Counter.inc_one Metrics.jobs_ok;
+      let* () = Lwt_io.write_line stderr ("["^num^"] succeeded.") in
+      Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpgoodlog ~pkg ~name logdir))
+    in
+    let mark_failure kind =
+      Prometheus.Counter.inc_one Metrics.jobs_error;
+      match kind with
+      | `Partial ->
+          let* () = Lwt_io.write_line stderr ("["^num^"] finished with a partial failure.") in
+          Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmppartiallog ~pkg ~name logdir))
+      | `Failure ->
+          let* () = Lwt_io.write_line stderr ("["^num^"] failed.") in
+          Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpbadlog ~pkg ~name logdir))
+      | `NotAvailable ->
+          let* () = Lwt_io.write_line stderr ("["^num^"] finished with not available.") in
+          Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpnotavailablelog ~pkg ~name logdir))
+      | `Other | `AcceptFailures | `Timeout ->
+          let* () = Lwt_io.write_line stderr ("["^num^"] finished with an internal failure.") in
+          Lwt_unix.rename (Fpath.to_string logfile) (Fpath.to_string (Server_workdirs.tmpinternalfailurelog ~pkg ~name logdir))
+    in
+    match Intf.Switch.build_with switch, v with
+    | Intf.Build_with.Day10, Ok () ->
+        (* day10 health-check exits 0 regardless of the package outcome; the
+           real result is the terminal marker in the log. *)
+        let* k = failure_kind_day10 logfile in
+        begin match k with
+        | `Success -> mark_good ()
+        | (`NotAvailable | `Partial | `Failure | `Other) as kind -> mark_failure kind
         end
+    | Intf.Build_with.Day10, Error () ->
+        (* day10 itself failed (crash / non-zero exit / capnp error). *)
+        mark_failure `Other
+    | (Intf.Build_with.Opam | Intf.Build_with.Dune), Ok () ->
+        mark_good ()
+    | (Intf.Build_with.Opam | Intf.Build_with.Dune), Error () ->
+        let* kind = failure_kind conf ~switch ~pkg logfile in
+        mark_failure kind
   end
 
 let () =
