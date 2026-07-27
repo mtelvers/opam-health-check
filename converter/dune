@@ -1,0 +1,5 @@
+(executable
+ (name tzst_convert)
+ (public_name opam-health-tzst-convert)
+ (package opam-health-check)
+ (libraries oca_lib fpath lwt lwt.unix containers))

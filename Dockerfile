@@ -9,9 +9,10 @@ WORKDIR /src/
 RUN opam exec -- dune build --release @install
 
 FROM debian:12
-RUN apt-get update && apt-get install netbase dumb-init libev-dev ca-certificates xz-utils tar pixz ugrep -y --no-install-recommends
+RUN apt-get update && apt-get install netbase dumb-init libev-dev ca-certificates xz-utils tar pixz zstd ugrep -y --no-install-recommends
 WORKDIR /var/lib/opam-health-check
 ENTRYPOINT ["dumb-init", "/usr/local/bin/opam-health-serve"]
 ENV OCAMLRUNPARAM=b
 COPY --from=build /src/_build/install/default/bin/opam-health-serve /usr/local/bin/
 COPY --from=build /src/_build/install/default/bin/opam-health-check /usr/local/bin/
+COPY --from=build /src/_build/install/default/bin/opam-health-tzst-convert /usr/local/bin/

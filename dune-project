@@ -54,8 +54,7 @@
    (memtrace (>= 0.2.3))
    (tls-lwt (>= 0.16.0)) ; activate conduit with TLS for slack webhooks
    conf-libev ; Required for lwt to avoid hitting the limits of select(2)
-   conf-pixz ; TODO: Make it a library
-   ; TODO: Add conf-ugrep
+   ; TODO: Add conf-zstd and conf-ugrep (and conf-pixz while legacy .txz archives are still around)
   )
  (conflicts
   (dns-client-lwt (< 6.1.4)) ; Required to fix https://github.com/roburio/http-lwt-client/issues/8

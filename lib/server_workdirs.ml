@@ -17,7 +17,7 @@ let keyfile ~username workdir = keysdir workdir/username+"key"
 
 type logdir_files = string list
 
-type logdir_ty = Uncompressed | Compressed
+type logdir_ty = Uncompressed | CompressedTxz (* legacy, read-only *) | CompressedTzst of Tzst.index
 type logdir = Logdir of (logdir_ty * float * string * t * logdir_files)
 (* TODO: differenciate logdir and tmplogdir *)
 
@@ -25,7 +25,7 @@ let base_logdir workdir = workdir/"logs"
 let base_tmpdir workdir = workdir/"tmp"
 
 let new_logdir ~compressed ~hash ~start_time workdir =
-  let ty = if compressed then Compressed else Uncompressed in
+  let ty = if compressed then CompressedTzst Tzst.empty else Uncompressed in
   Logdir (ty, start_time, hash, workdir, [])
 
 let logdirs workdir =
@@ -43,7 +43,10 @@ let logdirs workdir =
             Logdir (Uncompressed, float_of_string time, hash, workdir, files)
         | [hash; "txz"] ->
             let+ files = Lwt_pool.use pool (fun () -> Oca_lib.scan_tpxz_archive logdir) in
-            Logdir (Compressed, float_of_string time, hash, workdir, files)
+            Logdir (CompressedTxz, float_of_string time, hash, workdir, files)
+        | [hash; "tzst"] ->
+            let+ index = Lwt_pool.use pool (fun () -> Tzst.read_index logdir) in
+            Logdir (CompressedTzst index, float_of_string time, hash, workdir, Tzst.entry_paths index)
         | _ -> assert false
         end
     | _ -> assert false
@@ -51,9 +54,11 @@ let logdirs workdir =
 
 let logdir_ty_equal ty1 ty2 = match ty1, ty2 with
   | Uncompressed, Uncompressed
-  | Compressed, Compressed -> true
+  | CompressedTxz, CompressedTxz
+  | CompressedTzst _, CompressedTzst _ -> true
   | Uncompressed, _
-  | Compressed, _ -> false
+  | CompressedTxz, _
+  | CompressedTzst _, _ -> false
 
 let logdir_equal (Logdir (ty1, time1, hash1, workdir1, _files1)) (Logdir (ty2, time2, hash2, workdir2, _files2)) =
   logdir_ty_equal ty1 ty2 &&
@@ -93,20 +98,29 @@ let logdir_get_content ~comp ~state ~pkg = function
       let state = Intf.State.to_string state in
       let file = base_logdir workdir/get_logdir_name logdir/comp/state/pkg in
       Lwt_io.with_file ~mode:Lwt_io.Input (Fpath.to_string file) (Lwt_io.read ?count:None)
-  | Logdir (Compressed, _, _, workdir, _) as logdir ->
+  | Logdir (CompressedTxz, _, _, workdir, _) as logdir ->
       let archive = base_logdir workdir/get_logdir_name logdir+"txz" in
       let comp = Intf.Compiler.to_string comp in
       let state = Intf.State.to_string state in
       let file = comp^"/"^state^"/"^pkg in
       Oca_lib.random_access_tpxz_archive ~file archive
+  | Logdir (CompressedTzst index, _, _, workdir, _) as logdir ->
+      let archive = base_logdir workdir/get_logdir_name logdir+"tzst" in
+      let comp = Intf.Compiler.to_string comp in
+      let state = Intf.State.to_string state in
+      let file = comp^"/"^state^"/"^pkg in
+      Tzst.read_member ~file ~index archive
 
 let logdir_search ~switch ~regexp = function
   | Logdir (Uncompressed, _, _, workdir, _) as logdir ->
       let cwd = base_logdir workdir/get_logdir_name logdir in
       Oca_lib.ugrep_dir ~switch ~regexp ~cwd
-  | Logdir (Compressed, _, _, workdir, _) as logdir ->
+  | Logdir (CompressedTxz, _, _, workdir, _) as logdir ->
       let archive = base_logdir workdir/get_logdir_name logdir+"txz" in
       Oca_lib.ugrep_tpxz ~switch ~regexp ~archive
+  | Logdir (CompressedTzst index, _, _, workdir, _) as logdir ->
+      let archive = base_logdir workdir/get_logdir_name logdir+"tzst" in
+      Tzst.search ~switch ~regexp ~index archive
 
 let tmpdir (Logdir (_, _, _, workdir, _) as logdir) = base_tmpdir workdir/get_logdir_name logdir
 
@@ -115,12 +129,16 @@ let tmpswitchlogdir ~name logdir = tmplogdir logdir/name
 
 let logdir_move ~names (Logdir (ty, _, _, workdir, _) as logdir) =
   match ty with
-  | Compressed ->
+  | CompressedTzst _ ->
       let cwd = tmplogdir logdir in
       let directories = names in
-      let archive = base_logdir workdir/get_logdir_name logdir+"txz" in
-      let* () = Oca_lib.compress_tpxz_archive ~cwd ~directories archive in
+      let archive = base_logdir workdir/get_logdir_name logdir+"tzst" in
+      let* () = Tzst.create ~cwd ~directories archive in
       Oca_lib.rm_rf cwd
+  | CompressedTxz ->
+      (* new runs are always written as .tzst; .txz archives only come from
+         disk and are never the target of a move *)
+      assert false
   | Uncompressed ->
       let tmplogdir = tmplogdir logdir in
       let logdir = base_logdir workdir/get_logdir_name logdir in

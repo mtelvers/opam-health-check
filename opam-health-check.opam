@@ -47,7 +47,6 @@ depends: [
   "memtrace" {>= "0.2.3"}
   "tls-lwt" {>= "0.16.0"}
   "conf-libev"
-  "conf-pixz"
   "odoc" {with-doc}
 ]
 conflicts: [
