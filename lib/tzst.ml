@@ -101,9 +101,6 @@ let read_lines ic =
 let zstd_compress input =
   with_filter ~timeout:600. ~write:(write_string input) ["zstd"; "-q"; zstd_level] read_string
 
-let zstd_decompress input =
-  with_filter ~timeout:60. ~write:(write_string input) ["zstd"; "-q"; "-d"; "-c"] read_string
-
 (* Lwt_io.read ~count may return fewer bytes than requested *)
 let really_read ic len =
   let buf = Bytes.create len in
@@ -123,6 +120,12 @@ let read_range ~off ~len archive =
     let* () = Lwt_io.set_position ic (Int64.of_int off) in
     really_read ic len
   end
+
+(* the exact decompressed size is known from the index, so read straight
+   into a buffer of that size instead of growing a string chunk by chunk *)
+let zstd_decompress ~u_size input =
+  with_filter ~timeout:60. ~write:(write_string input) ["zstd"; "-q"; "-d"; "-c"]
+    (fun ic -> really_read ic u_size)
 
 (* ustar splits names longer than 100 bytes into a prefix and a name field,
    joined back with a '/' *)
@@ -260,6 +263,7 @@ let index_of_string s =
 
 let compression_pool = Lwt_pool.create 8 (fun () -> Lwt.return_unit)
 let max_inflight = 8
+let search_pool = Lwt_pool.create 4 (fun () -> Lwt.return_unit)
 
 let create ~cwd ~directories archive =
   let* srcs =
@@ -347,14 +351,40 @@ let read_index archive =
     end
   end
 
+(* Neighbouring log pages live in the same frame (a frame holds ~100
+   entries) and crawlers walk pages in index order, so keep the last few
+   decompressed frames around. The cache holds promises: concurrent requests
+   for the same frame share a single decompression. *)
+let cache_max_frames = 4
+let frame_cache : (string * int, string Lwt.t) Hashtbl.t = Hashtbl.create 16
+let frame_cache_order : (string * int) Queue.t = Queue.create ()
+
+let get_frame ~index archive frame_idx =
+  let key = (Fpath.to_string archive, frame_idx) in
+  match Hashtbl.find_opt frame_cache key with
+  | Some frame -> frame
+  | None ->
+      let frame = index.frames.(frame_idx) in
+      let p =
+        let* compressed = read_range ~off:frame.c_off ~len:frame.c_size archive in
+        zstd_decompress ~u_size:frame.u_size compressed
+      in
+      Hashtbl.replace frame_cache key p;
+      Queue.push key frame_cache_order;
+      if Queue.length frame_cache_order > cache_max_frames then
+        Hashtbl.remove frame_cache (Queue.pop frame_cache_order);
+      Lwt.on_failure p (fun _ ->
+        match Hashtbl.find_opt frame_cache key with
+        | Some q when Stdlib.(==) q p -> Hashtbl.remove frame_cache key
+        | Some _ | None -> ());
+      p
+
 let read_member ~file ~index archive =
   match Hashtbl.find_opt index.files file with
   | None ->
       Lwt.fail (Failure ("Tzst: no entry "^file^" in "^Fpath.to_string archive))
   | Some entry ->
-      let frame = index.frames.(entry.frame_idx) in
-      let* compressed = read_range ~off:frame.c_off ~len:frame.c_size archive in
-      let+ u = zstd_decompress compressed in
+      let+ u = get_frame ~index archive entry.frame_idx in
       String.sub u (entry.header_off + 512) entry.size
 
 let search ~switch ~regexp ~index archive =
@@ -369,20 +399,37 @@ let search ~switch ~regexp ~index archive =
       let abs entry = index.frames.(entry.frame_idx).u_off + entry.header_off in
       let start = abs first in
       let stop = abs last + 512 + round512 last.size in
+      let relevant =
+        List.filter (fun frame -> frame.u_off + frame.u_size > start && frame.u_off < stop)
+          (Array.to_list index.frames)
+      in
+      (* decompress up to 4 frames in parallel, stream them to ugrep in order *)
       let write oc =
+        let pending = Queue.create () in
+        let drain_one () =
+          let (frame, p) = Queue.pop pending in
+          let* u = p in
+          let lo = max 0 (start - frame.u_off) in
+          let hi = min frame.u_size (stop - frame.u_off) in
+          Lwt_io.write oc (String.sub u lo (hi - lo))
+        in
         let* () =
           Lwt_list.iter_s begin fun frame ->
-            if frame.u_off + frame.u_size <= start || frame.u_off >= stop then
-              Lwt.return_unit
-            else begin
-              let* compressed = read_range ~off:frame.c_off ~len:frame.c_size archive in
-              let* u = zstd_decompress compressed in
-              let lo = max 0 (start - frame.u_off) in
-              let hi = min frame.u_size (stop - frame.u_off) in
-              Lwt_io.write oc (String.sub u lo (hi - lo))
-            end
-          end (Array.to_list index.frames)
+            let p =
+              Lwt_pool.use search_pool begin fun () ->
+                let* compressed = read_range ~off:frame.c_off ~len:frame.c_size archive in
+                zstd_decompress ~u_size:frame.u_size compressed
+              end
+            in
+            Queue.push (frame, p) pending;
+            if Queue.length pending > 4 then drain_one () else Lwt.return_unit
+          end relevant
         in
+        let rec drain () =
+          if Queue.is_empty pending then Lwt.return_unit
+          else let* () = drain_one () in drain ()
+        in
+        let* () = drain () in
         Lwt_io.write oc (String.make 1024 '\000')
       in
       with_filter ~exit1:true ~timeout:60. ~write ["ugrep"; "-zl"; "--format=%z%~"; "--regexp="^regexp] read_lines

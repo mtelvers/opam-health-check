@@ -28,6 +28,7 @@ let () =
     | _ ->
         usage ()
   in
+  Lwt_io.set_default_buffer_size (1 lsl 18);
   Lwt_main.run begin
     let tmpdir = dst^".tmp" in
     let* () = Oca_lib.mkdir_p (Fpath.v tmpdir) in

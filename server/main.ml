@@ -1,6 +1,10 @@
 module Server = Oca_server.Server.Make (Backend)
 
-let main debug workdir cap_file = Lwt_main.run (Server.main ~debug ~cap_file ~workdir)
+let main debug workdir cap_file =
+  (* the log-archive read path moves multi-MB frames through pipes; the 4KB
+     default makes that thousands of tiny reads *)
+  Lwt_io.set_default_buffer_size (1 lsl 18);
+  Lwt_main.run (Server.main ~debug ~cap_file ~workdir)
 
 (* Command-line parsing *)
 
