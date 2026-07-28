@@ -10,6 +10,7 @@ val random_access_tpxz_archive : file:string -> Fpath.t -> string Lwt.t
 val compress_tpxz_archive : cwd:Fpath.t -> directories:string list -> Fpath.t -> unit Lwt.t
 val ugrep_dir : switch:string -> regexp:string -> cwd:Fpath.t -> string list Lwt.t
 val ugrep_tpxz : switch:string -> regexp:string -> archive:Fpath.t -> string list Lwt.t
+val ugrep_tzst_range : c_off:int -> c_len:int -> lead:int -> range_len:int -> regexp:string -> archive:Fpath.t -> string list Lwt.t
 val mkdir_p : Fpath.t -> unit Lwt.t
 val rm_rf : Fpath.t -> unit Lwt.t
 

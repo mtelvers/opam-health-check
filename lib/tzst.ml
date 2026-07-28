@@ -89,15 +89,6 @@ let with_filter ?(exit1=false) ~timeout ~write cmd read =
 let write_string s oc = Lwt_io.write oc s
 let read_string ic = Lwt_io.read ?count:None ic
 
-let read_lines ic =
-  let rec aux acc =
-    let* v = Lwt_io.read_line_opt ic in
-    match v with
-    | None -> Lwt.return acc
-    | Some line -> aux (line :: acc)
-  in
-  aux []
-
 let zstd_compress input =
   with_filter ~timeout:600. ~write:(write_string input) ["zstd"; "-q"; zstd_level] read_string
 
@@ -263,7 +254,6 @@ let index_of_string s =
 
 let compression_pool = Lwt_pool.create 8 (fun () -> Lwt.return_unit)
 let max_inflight = 8
-let search_pool = Lwt_pool.create 4 (fun () -> Lwt.return_unit)
 
 let create ~cwd ~directories archive =
   let* srcs =
@@ -399,37 +389,17 @@ let search ~switch ~regexp ~index archive =
       let abs entry = index.frames.(entry.frame_idx).u_off + entry.header_off in
       let start = abs first in
       let stop = abs last + 512 + round512 last.size in
+      (* the overlapping frames are contiguous bytes of the archive, so the
+         whole search runs as one shell pipeline with no copying in OCaml *)
       let relevant =
         List.filter (fun frame -> frame.u_off + frame.u_size > start && frame.u_off < stop)
           (Array.to_list index.frames)
       in
-      (* decompress up to 4 frames in parallel, stream them to ugrep in order *)
-      let write oc =
-        let pending = Queue.create () in
-        let drain_one () =
-          let (frame, p) = Queue.pop pending in
-          let* u = p in
-          let lo = max 0 (start - frame.u_off) in
-          let hi = min frame.u_size (stop - frame.u_off) in
-          Lwt_io.write oc (String.sub u lo (hi - lo))
-        in
-        let* () =
-          Lwt_list.iter_s begin fun frame ->
-            let p =
-              Lwt_pool.use search_pool begin fun () ->
-                let* compressed = read_range ~off:frame.c_off ~len:frame.c_size archive in
-                zstd_decompress ~u_size:frame.u_size compressed
-              end
-            in
-            Queue.push (frame, p) pending;
-            if Queue.length pending > 4 then drain_one () else Lwt.return_unit
-          end relevant
-        in
-        let rec drain () =
-          if Queue.is_empty pending then Lwt.return_unit
-          else let* () = drain_one () in drain ()
-        in
-        let* () = drain () in
-        Lwt_io.write oc (String.make 1024 '\000')
-      in
-      with_filter ~exit1:true ~timeout:60. ~write ["ugrep"; "-zl"; "--format=%z%~"; "--regexp="^regexp] read_lines
+      let cfirst = List.hd relevant in
+      let clast = List.hd (List.rev relevant) in
+      Oca_lib.ugrep_tzst_range
+        ~c_off:cfirst.c_off
+        ~c_len:(clast.c_off + clast.c_size - cfirst.c_off)
+        ~lead:(start - cfirst.u_off)
+        ~range_len:(stop - start)
+        ~regexp ~archive

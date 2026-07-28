@@ -110,6 +110,21 @@ let ugrep_tpxz ~switch ~regexp ~archive =
   let archive = Filename.quote (Fpath.to_string archive) in
   pread ~timeout:60. ~exit1:[] ["sh"; "-c"; "pixz -x "^switch^" -i "^archive^" | ugrep -zl --format='%z%~' --regexp="^regexp] read_unordered_lines
 
+(* Decompress the frames at [c_off, c_off+c_len) of a .tzst archive, cut the
+   tar byte range [lead, lead+range_len) out of the decompressed stream,
+   append a tar end-of-archive marker and grep the resulting tar stream. *)
+let ugrep_tzst_range ~c_off ~c_len ~lead ~range_len ~regexp ~archive =
+  let regexp = Filename.quote regexp in
+  let archive = Filename.quote (Fpath.to_string archive) in
+  let cmd =
+    Printf.sprintf
+      "{ dd if=%s iflag=skip_bytes,count_bytes skip=%d count=%d status=none \
+         | zstd -q -d -c | tail -c +%d | head -c %d; head -c 1024 /dev/zero; } \
+         | ugrep -zl --format='%%z%%~' --regexp=%s"
+      archive c_off c_len (lead + 1) range_len regexp
+  in
+  pread ~timeout:60. ~exit1:[] ["sh"; "-c"; cmd] read_unordered_lines
+
 let mkdir_p dir =
   let rec aux base = function
     | [] ->
